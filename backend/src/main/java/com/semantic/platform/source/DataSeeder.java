@@ -4,6 +4,7 @@ import com.semantic.platform.metric.MetricService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.boot.CommandLineRunner;
+import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -17,8 +18,11 @@ import java.util.List;
 /**
  * 样例数据播种：订单/订单行/退款/门店状态/节假日/批次，以及预置指标与报表。
  * 覆盖回放场景：跨营业日订单、多次部分退款、临时闭店、跨期新店、缺批次数据、迟到退款。
+ * 分布查询场景：多行商品拆单、多渠道支付、重复/冲突回执、零额/撤销/未支付订单、
+ * 大额团购长尾、待核订单、去重决议演示订单对。
  */
 @Component
+@Order(0) // 先于 DistBootstrap（@Order(10)）运行
 public class DataSeeder implements CommandLineRunner {
 
     private static final Logger log = LoggerFactory.getLogger(DataSeeder.class);
@@ -29,11 +33,14 @@ public class DataSeeder implements CommandLineRunner {
     private final StoreStatusRepository storeStatusRepo;
     private final HolidayRepository holidayRepo;
     private final SourceBatchRepository batchRepo;
+    private final PaymentFactRepository paymentRepo;
+    private final OrderReceiptRepository receiptRepo;
     private final MetricService metricService;
 
     public DataSeeder(OrderFactRepository orderRepo, OrderLineRepository orderLineRepo,
                       RefundFactRepository refundRepo, StoreStatusRepository storeStatusRepo,
                       HolidayRepository holidayRepo, SourceBatchRepository batchRepo,
+                      PaymentFactRepository paymentRepo, OrderReceiptRepository receiptRepo,
                       MetricService metricService) {
         this.orderRepo = orderRepo;
         this.orderLineRepo = orderLineRepo;
@@ -41,6 +48,8 @@ public class DataSeeder implements CommandLineRunner {
         this.storeStatusRepo = storeStatusRepo;
         this.holidayRepo = holidayRepo;
         this.batchRepo = batchRepo;
+        this.paymentRepo = paymentRepo;
+        this.receiptRepo = receiptRepo;
         this.metricService = metricService;
     }
 
@@ -55,6 +64,7 @@ public class DataSeeder implements CommandLineRunner {
         seedHolidays();
         seedOrders();
         seedRefunds();
+        seedDistributionSamples();
         seedBatches();
         seedMetrics();
         log.info("样例数据播种完成");
@@ -153,7 +163,7 @@ public class DataSeeder implements CommandLineRunner {
         o.setOrderId(id);
         o.setStoreId(store);
         o.setOrderedAt(OffsetDateTime.parse(orderedAt));
-        o.setPaidAt(OffsetDateTime.parse(paidAt));
+        o.setPaidAt(paidAt == null ? null : OffsetDateTime.parse(paidAt));
         o.setBusinessDate(businessDate);
         o.setAmount(new BigDecimal(amount));
         o.setCurrency(currency);
@@ -197,11 +207,111 @@ public class DataSeeder implements CommandLineRunner {
         refundRepo.save(r);
     }
 
+    // ---------- 分布查询样例 ----------
+    // 密集小额日常单 + 长尾大额团购（平均客单价平稳、分布结构不同），
+    // 以及多行拆单、多渠道支付、重复/冲突回执、零额/撤销/未支付、待核订单。
+    private void seedDistributionSamples() {
+        String[] ch = {"pos", "online", "delivery"};
+        // S001 营业周 W06（2026-02-02 ~ 02-08）：38 笔小额日常单（25~95 元）
+        for (int i = 0; i < 38; i++) {
+            LocalDate d = LocalDate.of(2026, 2, 2).plusDays(i % 7);
+            order(String.format("O5%02d", i + 1), "S001", d + "T10:00:00Z", d + "T10:01:00Z", d,
+                    (25 + (i * 7) % 71) + ".00", "CNY", "completed", ch[i % 3]);
+        }
+        // S001 营业周 W07（2026-02-09 ~ 02-15）：30 笔小额日常单（30~90 元）
+        for (int i = 0; i < 30; i++) {
+            LocalDate d = LocalDate.of(2026, 2, 9).plusDays(i % 7);
+            order(String.format("O6%02d", i + 1), "S001", d + "T11:00:00Z", d + "T11:01:00Z", d,
+                    (30 + (i * 11) % 61) + ".00", "CNY", "completed", ch[(i + 1) % 3]);
+        }
+        // S002 W06：12 笔小额单；W07：仅 3 笔（小样本不可用演示）
+        for (int i = 0; i < 12; i++) {
+            LocalDate d = LocalDate.of(2026, 2, 2).plusDays(i % 7);
+            order(String.format("O7%02d", i + 1), "S002", d + "T12:00:00Z", d + "T12:01:00Z", d,
+                    (35 + (i * 5) % 46) + ".00", "CNY", "completed", ch[i % 3]);
+        }
+        String[][] s002w7 = {{"O801", "2026-02-09", "45.00"}, {"O802", "2026-02-10", "60.00"}, {"O803", "2026-02-11", "52.00"}};
+        for (String[] r : s002w7) {
+            order(r[0], "S002", r[1] + "T12:00:00Z", r[1] + "T12:01:00Z", LocalDate.parse(r[1]), r[2], "CNY", "completed", "pos");
+        }
+
+        // 长尾大额团购（groupon 渠道）
+        order("O-GRP3", "S001", "2026-02-03T16:00:00Z", "2026-02-03T16:01:00Z", LocalDate.of(2026, 2, 3), "5200.00", "CNY", "completed", "groupon");
+        order("O-GRP1", "S001", "2026-02-04T16:00:00Z", "2026-02-04T16:01:00Z", LocalDate.of(2026, 2, 4), "8600.00", "CNY", "completed", "groupon");
+        order("O-GRP2", "S001", "2026-02-11T16:00:00Z", "2026-02-11T16:01:00Z", LocalDate.of(2026, 2, 11), "12000.00", "CNY", "completed", "groupon");
+
+        // 零额订单（全额抵扣，净额 0 计入分布）
+        order("O-ZERO", "S001", "2026-02-03T09:00:00Z", "2026-02-03T09:01:00Z", LocalDate.of(2026, 2, 3), "0.00", "CNY", "completed", "pos");
+        // 撤销订单（不得混入已完成交易）
+        order("O-VOID", "S001", "2026-02-03T09:30:00Z", null, LocalDate.of(2026, 2, 3), "150.00", "CNY", "void", "pos");
+        receipt("RC-VOID-1", "O-VOID", "S001", "void", "150.00", "2026-02-03T09:35:00Z", "2026-02-03T09:35:05Z");
+        // 未完成支付（不得混入已完成交易）
+        order("O-UNPAID", "S001", "2026-02-04T09:00:00Z", null, LocalDate.of(2026, 2, 4), "200.00", "CNY", "unpaid", "online");
+
+        // 重复回执（同一 receipt_id 到达两次，不得复制订单）
+        order("O-DUP", "S001", "2026-02-04T10:00:00Z", "2026-02-04T10:01:00Z", LocalDate.of(2026, 2, 4), "260.00", "CNY", "completed", "pos");
+        receipt("RC-DUP-1", "O-DUP", "S001", "completed", "260.00", "2026-02-04T10:05:00Z", "2026-02-04T10:05:05Z");
+        receipt("RC-DUP-1", "O-DUP", "S001", "completed", "260.00", "2026-02-04T10:05:00Z", "2026-02-04T10:05:07Z");
+        // O-DUP2 与 O-DUP 是同一真实订单的两个键（POS 重试产生），供去重决议演示
+        order("O-DUP2", "S001", "2026-02-04T10:00:30Z", "2026-02-04T10:01:30Z", LocalDate.of(2026, 2, 4), "260.00", "CNY", "completed", "pos");
+
+        // 多渠道支付（一张订单两个支付渠道，合计 = 订单金额）
+        order("O-PAY2", "S001", "2026-02-04T13:00:00Z", "2026-02-04T13:01:00Z", LocalDate.of(2026, 2, 4), "320.00", "CNY", "completed", "pos");
+        payment("P-101", "O-PAY2", "S001", "wechat", "120.00", "2026-02-04T13:01:00Z", LocalDate.of(2026, 2, 4));
+        payment("P-102", "O-PAY2", "S001", "alipay", "200.00", "2026-02-04T13:01:00Z", LocalDate.of(2026, 2, 4));
+
+        // 已有订单补充支付流水（O003 多行拆单 900 = 现金 400 + 卡 500）
+        payment("P-001", "O003", "S001", "cash", "400.00", "2026-01-15T12:01:00Z", LocalDate.of(2026, 1, 15));
+        payment("P-002", "O003", "S001", "card", "500.00", "2026-01-15T12:01:00Z", LocalDate.of(2026, 1, 15));
+        // 团购单支付流水
+        payment("P-301", "O-GRP1", "S001", "groupon", "8600.00", "2026-02-04T16:01:00Z", LocalDate.of(2026, 2, 4));
+        payment("P-302", "O-GRP2", "S001", "groupon", "12000.00", "2026-02-11T16:01:00Z", LocalDate.of(2026, 2, 11));
+        payment("P-303", "O-GRP3", "S001", "groupon", "5200.00", "2026-02-03T16:01:00Z", LocalDate.of(2026, 2, 3));
+
+        // 冲突回执 → 无法确定最终状态 → 待核
+        order("O-CONFLICT", "S002", "2026-02-04T11:30:00Z", "2026-02-04T11:31:00Z", LocalDate.of(2026, 2, 4), "300.00", "CNY", "completed", "pos");
+        receipt("RC-CON-1", "O-CONFLICT", "S002", "completed", "300.00", "2026-02-04T12:00:00Z", "2026-02-04T12:00:05Z");
+        receipt("RC-CON-2", "O-CONFLICT", "S002", "void", "300.00", "2026-02-04T12:00:00Z", "2026-02-04T12:00:06Z");
+        // 支付合计与订单金额不一致（无订单行仲裁）→ 金额待核
+        order("O-PAYX", "S002", "2026-02-05T14:00:00Z", "2026-02-05T14:01:00Z", LocalDate.of(2026, 2, 5), "500.00", "CNY", "completed", "pos");
+        payment("P-201", "O-PAYX", "S002", "cash", "450.00", "2026-02-05T14:01:00Z", LocalDate.of(2026, 2, 5));
+
+        // 正常回执流转示例（paid → completed）
+        receipt("RC-501-1", "O501", "S001", "paid", "25.00", "2026-02-02T10:01:00Z", "2026-02-02T10:01:05Z");
+        receipt("RC-501-2", "O501", "S001", "completed", "25.00", "2026-02-02T10:02:00Z", "2026-02-02T10:02:05Z");
+    }
+
+    private void payment(String id, String orderId, String store, String channel, String amount,
+                         String paidAt, LocalDate businessDate) {
+        PaymentFact p = new PaymentFact();
+        p.setPaymentId(id);
+        p.setOrderId(orderId);
+        p.setStoreId(store);
+        p.setChannel(channel);
+        p.setAmount(new BigDecimal(amount));
+        p.setPaidAt(OffsetDateTime.parse(paidAt));
+        p.setBusinessDate(businessDate);
+        paymentRepo.save(p);
+    }
+
+    private void receipt(String receiptId, String orderId, String store, String status, String amount,
+                         String receiptAt, String receivedAt) {
+        OrderReceipt r = new OrderReceipt();
+        r.setReceiptId(receiptId);
+        r.setOrderId(orderId);
+        r.setStoreId(store);
+        r.setStatus(status);
+        r.setAmount(new BigDecimal(amount));
+        r.setReceiptAt(OffsetDateTime.parse(receiptAt));
+        r.setReceivedAt(OffsetDateTime.parse(receivedAt));
+        receiptRepo.save(r);
+    }
+
     // ---------- 批次（含缺批次、迟到批次） ----------
     private void seedBatches() {
         // 订单批次：按门店分批
-        batch("orders", "S001", "loaded", LocalDate.of(2026, 1, 1), LocalDate.of(2026, 3, 31), 7);
-        batch("orders", "S002", "loaded", LocalDate.of(2026, 1, 1), LocalDate.of(2026, 3, 31), 4);
+        batch("orders", "S001", "loaded", LocalDate.of(2026, 1, 1), LocalDate.of(2026, 3, 31), 84);
+        batch("orders", "S002", "loaded", LocalDate.of(2026, 1, 1), LocalDate.of(2026, 3, 31), 21);
         batch("orders", "S003", "loaded", LocalDate.of(2026, 1, 1), LocalDate.of(2026, 1, 31), 1);
         // S003 2/1-2/7 仍在补数（缺批次场景）
         batch("orders", "S003", "backfilling", LocalDate.of(2026, 2, 1), LocalDate.of(2026, 2, 7), 0);
@@ -210,6 +320,9 @@ public class DataSeeder implements CommandLineRunner {
         batch("orders", "S005", "loaded", LocalDate.of(2026, 1, 1), LocalDate.of(2026, 3, 31), 3);
         // 退款批次：先到一批（不含 R003）
         batch("refunds", null, "loaded", LocalDate.of(2026, 1, 1), LocalDate.of(2026, 2, 28), 2);
+        // 支付流水与状态回执批次
+        batch("payments", null, "loaded", LocalDate.of(2026, 1, 1), LocalDate.of(2026, 3, 31), 8);
+        batch("receipts", null, "loaded", LocalDate.of(2026, 1, 1), LocalDate.of(2026, 3, 31), 6);
         // 门店状态与节假日批次
         batch("store_hours", null, "loaded", LocalDate.of(2026, 1, 1), LocalDate.of(2026, 3, 31), 450);
         batch("holidays", null, "loaded", LocalDate.of(2026, 1, 1), LocalDate.of(2026, 12, 31), 4);

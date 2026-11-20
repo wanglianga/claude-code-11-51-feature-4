@@ -6,4 +6,5 @@ import java.util.List;
 
 public interface OrderLineRepository extends JpaRepository<OrderLine, Long> {
     List<OrderLine> findByBusinessDateBetween(LocalDate from, LocalDate to);
+    List<OrderLine> findByOrderIdIn(List<String> orderIds);
 }

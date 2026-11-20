@@ -18,6 +18,10 @@
           <el-icon><VideoPlay /></el-icon>
           <span>运行结果</span>
         </el-menu-item>
+        <el-menu-item index="/distribution">
+          <el-icon><Histogram /></el-icon>
+          <span>分布查询</span>
+        </el-menu-item>
         <el-menu-item index="/reports">
           <el-icon><Grid /></el-icon>
           <span>报表中心</span>
@@ -66,7 +70,7 @@
 <script setup>
 import { computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DataAnalysis, HomeFilled, Document, VideoPlay, Grid, Stamp, FolderOpened, Share, UserFilled } from '@element-plus/icons-vue'
+import { DataAnalysis, HomeFilled, Document, VideoPlay, Grid, Stamp, FolderOpened, Share, UserFilled, Histogram } from '@element-plus/icons-vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -79,6 +83,7 @@ const breadcrumbs = computed(() => {
     '/': '首页',
     '/metrics': '指标目录',
     '/runs': '运行结果',
+    '/distribution': '分布查询',
     '/reports': '报表中心',
     '/approvals': '审批中心',
     '/sources': '数据源',

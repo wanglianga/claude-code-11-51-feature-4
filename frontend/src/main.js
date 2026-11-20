@@ -12,6 +12,7 @@ import ReportsView from './views/ReportsView.vue'
 import ApprovalsView from './views/ApprovalsView.vue'
 import SourcesView from './views/SourcesView.vue'
 import ImpactView from './views/ImpactView.vue'
+import DistributionView from './views/DistributionView.vue'
 
 const routes = [
   { path: '/login', name: 'login', component: LoginView },
@@ -19,6 +20,7 @@ const routes = [
   { path: '/metrics', name: 'metrics', component: MetricsView },
   { path: '/metrics/:key', name: 'metric-editor', component: MetricEditorView },
   { path: '/runs', name: 'runs', component: RunsView },
+  { path: '/distribution', name: 'distribution', component: DistributionView },
   { path: '/reports', name: 'reports', component: ReportsView },
   { path: '/approvals', name: 'approvals', component: ApprovalsView },
   { path: '/sources', name: 'sources', component: SourcesView },

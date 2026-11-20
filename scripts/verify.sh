@@ -1,6 +1,7 @@
 #!/bin/bash
 # 经营指标语义层与自助分析平台 — 端到端验证脚本
-# 覆盖：登录、指标校验（币种/粒度/环路）、运行、覆盖范围、迟到退款、报表更正
+# 覆盖：登录、指标校验（币种/粒度/环路）、运行、覆盖范围、迟到退款、报表更正，
+#       客单金额分布（编译/精确vs近似/误差界/样本守恒/降级/局部重建/发布冻结/去重决议）
 set -e
 BASE="${BASE:-http://localhost:8080}"
 PASS=0
@@ -8,6 +9,19 @@ FAIL=0
 
 ok() { PASS=$((PASS+1)); echo "  ✓ $1"; }
 bad() { FAIL=$((FAIL+1)); echo "  ✗ $1"; }
+
+# 就绪等待：服务可登录且样例数据播种完成（指标 ≥ 7），最多 90 秒
+echo "=== 0. 等待服务就绪 ==="
+READY=0
+for i in $(seq 1 30); do
+  T=$(curl -s -X POST "$BASE/api/auth/login" -H "Content-Type: application/json" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])" 2>/dev/null || true)
+  if [ -n "$T" ]; then
+    C=$(curl -s "$BASE/api/metrics" -H "X-Token: $T" | python3 -c "import sys,json;print(len(json.load(sys.stdin)))" 2>/dev/null || true)
+    if [ "${C:-0}" -ge 7 ]; then READY=1; break; fi
+  fi
+  sleep 3
+done
+[ "$READY" = "1" ] && ok "服务就绪（样例数据已播种）" || { bad "服务未就绪"; exit 1; }
 
 echo "=== 1. 登录 ==="
 TOKEN=$(curl -s -X POST "$BASE/api/auth/login" -H "Content-Type: application/json" -d '{"username":"admin","password":"admin123"}' | python3 -c "import sys,json;print(json.load(sys.stdin)['token'])" 2>/dev/null)
@@ -95,6 +109,157 @@ for c in json.load(sys.stdin):
         print('yes'); break")
   [ "$HASNUMDEN" = "yes" ] && ok "比率单元格含分子分母（上卷重新汇总）" || bad "比率分子分母缺失"
 fi
+
+# ============================================================
+# 客单金额分布查询（精确 vs 近似对照、误差界、样本守恒、局部重建、发布冻结）
+# ============================================================
+
+echo "=== 11. 订单金额编译（稳定订单键 → 单一观察值） ==="
+COMPILE=$(curl -s -X POST "$BASE/api/dist/compile" -H "$AUTH" -H "Content-Type: application/json" -d '{}')
+echo "$COMPILE" | python3 -c "
+import sys,json
+c=json.load(sys.stdin)
+assert c['compiledOrders']>=113, f\"编译订单数异常: {c['compiledOrders']}\"
+assert c['pending']>=2 and c['excluded']>=3, f\"状态分类异常: {c}\"
+print('ok')" > /dev/null 2>&1 && ok "全量编译：113+ 订单键各得一个观察值（待核/排除单列）" || bad "编译或状态分类异常: $COMPILE"
+PENDING=$(curl -s "$BASE/api/dist/orders?state=pending" -H "$AUTH")
+echo "$PENDING" | grep -q "O-CONFLICT" && echo "$PENDING" | grep -q "O-PAYX" \
+  && ok "待核单列：回执冲突(O-CONFLICT)、支付不一致(O-PAYX)" || bad "待核订单缺失: $PENDING"
+EXCLUDED=$(curl -s "$BASE/api/dist/orders?state=excluded" -H "$AUTH")
+echo "$EXCLUDED" | grep -q "O-VOID" && echo "$EXCLUDED" | grep -q "O-UNPAID" && echo "$EXCLUDED" | grep -q "O004" \
+  && ok "撤销/未支付/外币不混入已完成交易" || bad "排除订单缺失: $EXCLUDED"
+
+echo "=== 12. 精确路线 vs 独立复算（相同样本，样本守恒） ==="
+curl -s "$BASE/api/dist/orders?storeId=S001&bizWeek=2026-W06" -H "$AUTH" > /tmp/dist_w06.json
+curl -s -X POST "$BASE/api/dist/query" -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{"from":"2026-02-02","to":"2026-02-08","storeIds":["S001"],"route":"exact"}' > /tmp/dist_q_exact.json
+python3 - <<'EOF' && ok "精确路线与独立复算一致（中位数/P90/高额占比），订单总体=样本+待核+排除" || bad "精确路线与独立复算不一致"
+import json
+obs=json.load(open('/tmp/dist_w06.json'))
+cell=json.load(open('/tmp/dist_q_exact.json'))['cells'][0]
+# 独立复算：从观察值明细重算
+nets=sorted(float(o['netAmount']) for o in obs if o['state']=='completed')
+def quantile(s,q):
+    h=q*(len(s)-1); i=int(h); f=h-i
+    return s[i]+f*(s[min(i+1,len(s)-1)]-s[i])
+assert len(nets)==cell['validSamples'], f"样本数不一致 {len(nets)} vs {cell['validSamples']}"
+assert cell['population']==cell['validSamples']+cell['pendingCount']+cell['excludedCount'], "样本不守恒"
+assert abs(quantile(nets,0.5)-float(cell['median']['value']))<1e-6, "中位数不一致"
+assert abs(quantile(nets,0.9)-float(cell['p90']['value']))<1e-6, "P90 不一致"
+high=sum(1 for v in nets if v>=1000)/len(nets)
+assert abs(high-float(cell['highRatio']['value']))<1e-6, "高额占比不一致"
+print('ok')
+EOF
+
+echo "=== 13. 近似路线 vs 精确路线（同一订单集合对照，误差界有效） ==="
+curl -s -X POST "$BASE/api/dist/query" -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{"from":"2026-02-02","to":"2026-02-08","storeIds":["S001"],"route":"approx"}' > /tmp/dist_q_approx.json
+python3 - <<'EOF' && ok "近似分位数真实排名落在报告的误差界内，且与精确值一致" || bad "近似路线误差界失效"
+import json
+obs=json.load(open('/tmp/dist_w06.json'))
+exact=json.load(open('/tmp/dist_q_exact.json'))['cells'][0]
+approx=json.load(open('/tmp/dist_q_approx.json'))['cells'][0]
+assert approx['route']=='approx' and not approx['degraded'], "应走近似路线"
+nets=sorted(float(o['netAmount']) for o in obs if o['state']=='completed')
+n=len(nets)
+for m,q in [('median',0.5),('p90',0.9)]:
+    est=approx[m]; ev=float(exact[m]['value']); av=float(est['value'])
+    # 近似值的真实排名（<=av 的样本数）必须落在 [rankLo,rankHi] 内
+    rank=sum(1 for v in nets if v<=av)
+    assert est['rankLo']-1e-9<=rank<=est['rankHi']+1e-9, f"{m} 真实排名 {rank} 超出界 [{est['rankLo']},{est['rankHi']}]"
+    # 排名与 q 的偏差不超过误差界 + 离散化容差（type-7 约定与重复值各引入 ≤1 样本偏差）
+    assert abs(rank/n-q)<=float(est['rankErrorBound'])+1.5/n+0.001, f"{m} 排名偏差超误差界"
+    assert abs(av-ev)<=1.0, f"{m} 近似 {av} 与精确 {ev} 偏差过大"
+print('ok')
+EOF
+
+echo "=== 14. 业态维度下钻（渠道分格样本守恒） ==="
+curl -s -X POST "$BASE/api/dist/query" -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{"from":"2026-02-02","to":"2026-02-08","storeIds":["S001"],"dims":["channel"],"route":"exact","minSample":2}' > /tmp/dist_q_dim.json
+python3 - <<'EOF' && ok "渠道分格样本合计=全量样本；团购渠道高额占比=100%" || bad "维度下钻样本不守恒"
+import json
+exact=json.load(open('/tmp/dist_q_exact.json'))['cells'][0]
+cells=json.load(open('/tmp/dist_q_dim.json'))['cells']
+total=sum(c['validSamples'] for c in cells)
+assert total==exact['validSamples'], f"分格样本 {total} != 全量 {exact['validSamples']}"
+grp=[c for c in cells if c['dims'].get('channel')=='groupon'][0]
+assert abs(float(grp['highRatio']['value'])-1.0)<1e-9, "团购渠道高额占比应为 100%"
+assert float(grp['p90']['value'])>5000, "团购渠道 P90 应为大额"
+print('ok')
+EOF
+
+echo "=== 15. 小样本降级（标出不可用，不以均值替代） ==="
+SMALL=$(curl -s -X POST "$BASE/api/dist/query" -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{"from":"2026-02-09","to":"2026-02-15","storeIds":["S002"]}')
+echo "$SMALL" | python3 -c "
+import sys,json
+c=json.load(sys.stdin)['cells'][0]
+assert c['status']=='unavailable_small_sample', f\"应标出不可用: {c['status']}\"
+assert c['median'] is None and c['p90'] is None, '不得返回均值替代'
+print('ok')" > /dev/null 2>&1 && ok "有效样本 4 < 10 → 分位数不可用（未静默返回均值）" || bad "小样本降级失效: $SMALL"
+
+echo "=== 16. 不支持的过滤维度（不假称精确，降级并说明） ==="
+DEG=$(curl -s -X POST "$BASE/api/dist/query" -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{"from":"2026-02-02","to":"2026-02-08","storeIds":["S001"],"route":"approx","filters":{"amountMin":"50"}}')
+echo "$DEG" | python3 -c "
+import sys,json
+c=json.load(sys.stdin)['cells'][0]
+assert c['route']=='exact' and c['degraded'], '应降级为精确重算'
+assert c['degradeReason'], '必须说明降级原因'
+print('ok')" > /dev/null 2>&1 && ok "金额过滤无近似摘要 → 降级精确重算并显式标记" || bad "不支持维度降级失效: $DEG"
+
+echo "=== 17. 迟到部分退款：局部重建 + 发布冻结 ==="
+Q7='{"from":"2026-02-09","to":"2026-02-15","storeIds":["S001"],"route":"exact"}'
+BEFORE=$(curl -s -X POST "$BASE/api/dist/query" -H "$AUTH" -H "Content-Type: application/json" -d "$Q7")
+PUB=$(curl -s -X POST "$BASE/api/dist/publications" -H "$AUTH" -H "Content-Type: application/json" \
+  -d "{\"name\":\"verify-w07\",\"params\":$Q7}")
+PUBID=$(echo "$PUB" | python3 -c "import sys,json;print(json.load(sys.stdin)['id'])" 2>/dev/null)
+curl -s -X POST "$BASE/api/dist/revisions/late-refund" -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{"refundId":"RF-VERIFY-DIST","orderId":"O-GRP2","storeId":"S001","businessDate":"2026-02-20","amount":"11500.00"}' > /tmp/dist_refund.json
+AFTER=$(curl -s -X POST "$BASE/api/dist/query" -H "$AUTH" -H "Content-Type: application/json" -d "$Q7")
+PUBNOW=$(curl -s "$BASE/api/dist/publications/$PUBID" -H "$AUTH")
+printf '%s\n' "$BEFORE" "$AFTER" "$PUBNOW" | python3 -c "
+import sys,json
+lines=[json.loads(l) for l in sys.stdin if l.strip().startswith('{')]
+before,after,pub=lines[0],lines[1],lines[2]
+h0=float(before['cells'][0]['highRatio']['value'])
+h1=float(after['cells'][0]['highRatio']['value'])
+hp=float(pub['result']['cells'][0]['highRatio']['value'])
+# 退款已应用（首次或幂等重放）：当前高额占比必为 0（O-GRP2 净额 500 < 1000）
+assert h1==0.0, f'退款后高额占比应为 0: {h1}'
+# 发布快照保持发布时的样本与数值
+assert hp==h0, f'快照应冻结发布时值 {h0}，实际 {hp}'
+print('ok')" > /dev/null 2>&1 && ok "迟到退款只重建受影响集合；快照冻结发布时数值" || bad "迟到退款/发布冻结失效"
+# 局部重建：W07 摘要版本 > W06 摘要版本（仅受影响格重建）
+curl -s "$BASE/api/dist/summaries" -H "$AUTH" | python3 -c "
+import sys,json
+ss=json.load(sys.stdin)
+w06=max(s['compileId'] for s in ss if s['storeId']=='S001' and s['bizWeek']=='2026-W06')
+w07=max(s['compileId'] for s in ss if s['storeId']=='S001' and s['bizWeek']=='2026-W07')
+assert w07>w06, f'W07 摘要应重建（{w07}）而 W06 保持（{w06}）'
+print('ok')" > /dev/null 2>&1 && ok "仅受影响（门店×周）摘要版本重建，其它保持原版本" || bad "摘要局部重建失效"
+
+echo "=== 18. 订单去重决议（重复键排除，样本守恒） ==="
+W6B=$(curl -s -X POST "$BASE/api/dist/query" -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{"from":"2026-02-02","to":"2026-02-08","storeIds":["S001"],"route":"exact"}')
+DUPSTATE=$(curl -s "$BASE/api/dist/orders?state=excluded" -H "$AUTH" | grep -c "O-DUP2" || true)
+curl -s -X POST "$BASE/api/dist/revisions/dedup" -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{"canonicalKey":"O-DUP","duplicateKey":"O-DUP2"}' > /dev/null
+W6A=$(curl -s -X POST "$BASE/api/dist/query" -H "$AUTH" -H "Content-Type: application/json" \
+  -d '{"from":"2026-02-02","to":"2026-02-08","storeIds":["S001"],"route":"exact"}')
+printf '%s\n' "$W6B" "$W6A" | DUPSTATE=$DUPSTATE python3 -c "
+import sys,json,os
+lines=[json.loads(l) for l in sys.stdin if l.strip().startswith('{')]
+b,a=lines[0]['cells'][0],lines[1]['cells'][0]
+already=int(os.environ.get('DUPSTATE','0'))>0
+assert a['population']==b['population'], '订单总体不变'
+if already:
+    assert a['validSamples']==b['validSamples'], '幂等：已排除则样本不变'
+else:
+    assert a['validSamples']==b['validSamples']-1, '重复键排除后样本 -1'
+    assert a['excludedCount']==b['excludedCount']+1, '排除数 +1'
+assert a['population']==a['validSamples']+a['pendingCount']+a['excludedCount'], '样本守恒'
+print('ok')" > /dev/null 2>&1 && ok "去重决议：重复键排除不复制订单，总体不变样本守恒" || bad "去重决议失效"
 
 echo ""
 echo "=========================================="
